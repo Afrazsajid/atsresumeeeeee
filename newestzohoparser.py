@@ -10,10 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple, Any
+from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 
 # Optional dependencies
 try:
@@ -73,6 +75,334 @@ if not logger.handlers:
 
 
 # ---------------------------------------------------------------------
+# Resume filename pattern
+# Matches stems that START with Resume or CV (case-insensitive)
+# Examples that match:
+#   Resume-Manisha_mukeshbhai-Radadiya.docx
+#   Resume - John Smith.pdf
+#   CV_Ali-Khan.docx
+# ---------------------------------------------------------------------
+RESUME_STEM_RE = re.compile(r"^(resume|cv)(?:[-_ ]|$)", re.IGNORECASE)
+
+
+def is_resume_filename(name: str, supported_exts: Tuple[str, ...], exact_filename: str = "") -> bool:
+    if not name:
+        return False
+
+    if exact_filename and name.strip().lower() != exact_filename.strip().lower():
+        return False
+
+    p = Path(name)
+    if p.suffix.lower() not in supported_exts:
+        return False
+
+    return bool(RESUME_STEM_RE.match(p.stem))
+
+
+# ---------------------------------------------------------------------
+# Zoho WorkDrive Client
+# ---------------------------------------------------------------------
+class ZohoWorkDriveClient:
+    """
+    WorkDrive recursive folder walker with strict resume file filtering.
+
+    Required secrets in .streamlit/secrets.toml:
+
+    ZOHO_CLIENT_ID = "..."
+    ZOHO_CLIENT_SECRET = "..."
+    ZOHO_REFRESH_TOKEN = "..."
+
+    Optional region configuration:
+    ZOHO_ACCOUNTS_DOMAIN = "https://accounts.zoho.com"   # or accounts.zoho.eu, accounts.zoho.in, etc
+    ZOHO_API_BASE = "https://www.zohoapis.com"           # or www.zohoapis.eu, www.zohoapis.in, etc
+    ZOHO_WORKDRIVE_WEB_BASE = "https://workdrive.zoho.com"
+    """
+
+    def __init__(self):
+        self.client_id = st.secrets.get("ZOHO_CLIENT_ID", "")
+        self.client_secret = st.secrets.get("ZOHO_CLIENT_SECRET", "")
+        self.refresh_token = st.secrets.get("ZOHO_REFRESH_TOKEN", "")
+
+        self.accounts_domain = st.secrets.get("ZOHO_ACCOUNTS_DOMAIN", "https://accounts.zoho.com").rstrip("/")
+        self.api_base = st.secrets.get("ZOHO_API_BASE", "https://www.zohoapis.com").rstrip("/")
+        self.workdrive_web_base = st.secrets.get("ZOHO_WORKDRIVE_WEB_BASE", "https://workdrive.zoho.com").rstrip("/")
+
+        if not (self.client_id and self.client_secret and self.refresh_token):
+            raise ValueError("Missing Zoho secrets. Add ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN to secrets.toml")
+
+        self.workdrive_api_base = f"{self.api_base}/workdrive/api/v1"
+
+    def _get_cached_token(self) -> Optional[str]:
+        tok = st.session_state.get("zoho_access_token")
+        exp = st.session_state.get("zoho_access_token_expires_at", 0)
+        if tok and time.time() < exp - 30:
+            return tok
+        return None
+
+    def _cache_token(self, token: str, expires_in_sec: int):
+        st.session_state["zoho_access_token"] = token
+        st.session_state["zoho_access_token_expires_at"] = time.time() + int(expires_in_sec)
+
+    def refresh_access_token(self) -> str:
+        cached = self._get_cached_token()
+        if cached:
+            return cached
+
+        url = f"{self.accounts_domain}/oauth/v2/token"
+        data = {
+            "grant_type": "refresh_token",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "refresh_token": self.refresh_token,
+        }
+        r = requests.post(url, data=data, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Token refresh failed ({r.status_code}). {r.text}")
+
+        j = r.json()
+        token = j.get("access_token")
+        expires = int(j.get("expires_in_sec") or j.get("expires_in") or 3600)
+        if not token:
+            raise RuntimeError(f"Token refresh response missing access_token. {j}")
+
+        self._cache_token(token, expires)
+        return token
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Zoho-oauthtoken {self.refresh_access_token()}",
+            "Accept": "application/vnd.api+json",
+        }
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        r = requests.request(method, url, headers=self._headers(), timeout=kwargs.pop("timeout", 60), **kwargs)
+        if r.status_code == 401:
+            st.session_state.pop("zoho_access_token", None)
+            st.session_state.pop("zoho_access_token_expires_at", None)
+            r = requests.request(method, url, headers=self._headers(), timeout=kwargs.pop("timeout", 60), **kwargs)
+        return r
+
+    @staticmethod
+    def extract_resource_id(folder_link_or_id: str) -> str:
+        """
+        Tries hard to extract a WorkDrive folder ID from common link formats.
+        If it cannot, it expects user to paste the folder ID directly.
+        """
+        s = (folder_link_or_id or "").strip()
+        if not s:
+            raise ValueError("Folder link or id is empty.")
+
+        # If user already pasted an ID
+        if re.fullmatch(r"[A-Za-z0-9]{8,}", s):
+            return s
+
+        # Parse URL path and query
+        u = urlparse(s)
+        parts = [p for p in u.path.split("/") if p]
+        # Look for any token that resembles an ID
+        for p in reversed(parts):
+            if re.fullmatch(r"[A-Za-z0-9]{8,}", p):
+                return p
+
+        qs = parse_qs(u.query or "")
+        for key in ["id", "res_id", "folder_id", "resource_id"]:
+            if key in qs and qs[key]:
+                val = qs[key][0]
+                if re.fullmatch(r"[A-Za-z0-9]{8,}", val):
+                    return val
+
+        m = re.search(r"(?:folder|folders|file|files|id|res_id)=([A-Za-z0-9]{8,})", s, flags=re.I)
+        if m:
+            return m.group(1)
+
+        raise ValueError("Could not detect folder id from link. Paste the folder id directly.")
+
+    @staticmethod
+    def _item_name(it: Dict[str, Any]) -> str:
+        attrs = it.get("attributes") or {}
+        return (attrs.get("name") or it.get("name") or "").strip()
+
+    @staticmethod
+    def _item_id(it: Dict[str, Any]) -> str:
+        return (it.get("id") or "").strip()
+
+    @staticmethod
+    def _is_folder_item(it: Dict[str, Any]) -> bool:
+        t = (it.get("type") or "").lower()
+        attrs = it.get("attributes") or {}
+        # Different API shapes observed in the wild
+        if t == "folders":
+            return True
+        if attrs.get("is_folder") is True:
+            return True
+        if (attrs.get("type") or "").lower() == "folder":
+            return True
+        if (attrs.get("mime_type") or "").lower() in {"folder", "application/vnd.zoho.folder"}:
+            return True
+        if (attrs.get("file_type") or "").lower() == "folder":
+            return True
+        # If API returns everything as type "files", folder can still be distinguished by a flag
+        return False
+
+    @staticmethod
+    def _is_file_item(it: Dict[str, Any]) -> bool:
+        # Most APIs mark actual files as type "files"
+        # Some return type "files" for both and use flags
+        if ZohoWorkDriveClient._is_folder_item(it):
+            return False
+        t = (it.get("type") or "").lower()
+        if t == "files":
+            return True
+        attrs = it.get("attributes") or {}
+        if attrs.get("is_folder") is False:
+            return True
+        return bool(ZohoWorkDriveClient._item_name(it))
+
+    def _list_children_one_page(self, folder_id: str, offset: int, limit: int) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Tries multiple endpoints because WorkDrive API shapes vary by resource type and tenant.
+        Returns (items, has_more).
+        """
+        endpoints = [
+            f"{self.workdrive_api_base}/files/{folder_id}/files",
+            f"{self.workdrive_api_base}/folders/{folder_id}/files",
+            f"{self.workdrive_api_base}/folders/{folder_id}/children",
+            f"{self.workdrive_api_base}/files/{folder_id}/children",
+        ]
+
+        last_err = None
+        for url in endpoints:
+            params = {
+                "filter[type]": "all",
+                "page[limit]": limit,
+                "page[offset]": offset,
+            }
+            try:
+                r = self._request("GET", url, params=params, timeout=60)
+                if r.status_code != 200:
+                    last_err = f"{url} -> {r.status_code} {r.text[:400]}"
+                    continue
+
+                payload = r.json() if r.text else {}
+                items = payload.get("data", []) or []
+
+                # Sometimes folder children come in "included"
+                included = payload.get("included", []) or []
+                if included:
+                    items = list(items) + list(included)
+
+                # Keep only dict items
+                items = [x for x in items if isinstance(x, dict)]
+
+                has_more = False
+                links = payload.get("links") or {}
+                if isinstance(links, dict) and links.get("next"):
+                    has_more = True
+                else:
+                    # Offset paging heuristic
+                    has_more = len(payload.get("data", []) or []) >= limit
+
+                return items, has_more
+            except Exception as e:
+                last_err = f"{url} -> {e}"
+                continue
+
+        raise RuntimeError(f"Could not list folder children. Last error: {last_err}")
+
+    def list_resume_files_recursive(
+        self,
+        root_folder_id: str,
+        include_subfolders: bool,
+        supported_exts: Tuple[str, ...],
+        exact_filename: str = "",
+        max_items_safety: int = 20000
+    ) -> List[Dict[str, Any]]:
+        """
+        Walks every subfolder (folder of folder of folder) and returns only resume files.
+        Output items contain: id, name, virtual_path
+        """
+        results: List[Dict[str, Any]] = []
+        visited = set()
+
+        queue: List[Tuple[str, str]] = [(root_folder_id, "")]  # (folder_id, path_prefix)
+        scanned = 0
+
+        while queue:
+            folder_id, prefix = queue.pop(0)
+            if folder_id in visited:
+                continue
+            visited.add(folder_id)
+
+            offset = 0
+            limit = 50
+            loops = 0
+
+            while True:
+                loops += 1
+                if loops > 5000:
+                    raise RuntimeError("Safety stop. Too many pagination loops while listing WorkDrive folder contents.")
+
+                items, has_more = self._list_children_one_page(folder_id, offset=offset, limit=limit)
+                scanned += len(items)
+                if scanned > max_items_safety:
+                    raise RuntimeError("Safety stop. Too many items scanned. Narrow folder or increase max_items_safety.")
+
+                for it in items:
+                    name = self._item_name(it)
+                    it_id = self._item_id(it)
+                    if not it_id or not name:
+                        continue
+
+                    if self._is_folder_item(it):
+                        if include_subfolders:
+                            new_prefix = f"{prefix}{name}/"
+                            queue.append((it_id, new_prefix))
+                        continue
+
+                    if self._is_file_item(it):
+                        if is_resume_filename(name, supported_exts=supported_exts, exact_filename=exact_filename):
+                            results.append({
+                                "id": it_id,
+                                "name": name,
+                                "virtual_path": f"{prefix}{name}".strip(),
+                            })
+
+                if not has_more:
+                    break
+                offset += limit
+
+        results.sort(key=lambda x: (x.get("virtual_path") or x.get("name") or "").lower())
+        return results
+
+    def download_file_bytes(self, file_id: str) -> bytes:
+        """
+        Tries multiple download endpoints.
+        """
+        # 1) WorkDrive web download
+        url1 = f"{self.workdrive_web_base}/api/v1/download/{file_id}"
+        r = self._request("GET", url1, timeout=120, allow_redirects=True)
+        if r.status_code == 200 and r.content:
+            return r.content
+
+        # 2) download.zoho.com fallback
+        url2 = "https://download.zoho.com/v1/workdrive/download/" + file_id
+        r2 = self._request("GET", url2, timeout=120, allow_redirects=True)
+        if r2.status_code == 200 and r2.content:
+            return r2.content
+
+        # 3) WorkDrive API direct download, some tenants support this
+        url3 = f"{self.workdrive_api_base}/download/{file_id}"
+        r3 = self._request("GET", url3, timeout=120, allow_redirects=True)
+        if r3.status_code == 200 and r3.content:
+            return r3.content
+
+        raise RuntimeError(
+            f"Download failed for file_id={file_id}. "
+            f"status1={r.status_code}, status2={r2.status_code}, status3={r3.status_code}"
+        )
+
+
+# ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
 MONTHS = {
@@ -93,13 +423,12 @@ MONTHS = {
 @dataclass
 class AppConfig:
     supported_exts: Tuple[str, ...] = (".pdf", ".docx")
-    filename_must_contain: Tuple[str, ...] = ("resume", "cv")  # case-insensitive substring
     max_file_mb: int = 15
 
     spacy_model_preference: Tuple[str, ...] = ("en_core_web_lg", "en_core_web_md", "en_core_web_sm")
 
     # PDF extraction tuning
-    min_extracted_alpha_chars_for_pdf: int = 400  # if less, treat as scanned
+    min_extracted_alpha_chars_for_pdf: int = 400
     drop_repeated_header_footer_ratio: float = 0.60
 
     # OCR
@@ -107,7 +436,7 @@ class AppConfig:
     ocr_lang: str = "eng"
 
     # Skills
-    embedding_similarity_threshold: float = 0.70  # keep near matches for recall
+    embedding_similarity_threshold: float = 0.70
     keep_unmatched_skill_phrases: bool = True
 
     # Performance
@@ -143,12 +472,10 @@ class AppConfig:
     email_re: re.Pattern = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", re.I)
     uk_postcode_re: re.Pattern = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s*(\d[A-Z]{2})\b", re.I)
 
-    # Date range patterns for experience
-    # Examples: Nov 2024 - Current, Sep 2024 – Aug 2025, 2021 - 2022
     date_range_re: re.Pattern = re.compile(
         r"(?P<start>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
         r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|\b(19|20)\d{2}\b)"
-        r"\s*(?:-+|–|—|to)\s*"
+        r"\s*(?:-+|–|to)\s*"
         r"(?P<end>(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
         r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t)?(?:ember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}|\b(19|20)\d{2}\b|present|current|now)"
         , re.I
@@ -183,7 +510,6 @@ def normalise_whitespace_keep_lines(text: str) -> str:
     for ln in text.split("\n"):
         ln2 = re.sub(r"[ \t]+", " ", ln).strip()
         lines.append(ln2)
-    # Keep line breaks. Collapse excessive blank lines.
     out = "\n".join(lines)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
@@ -209,11 +535,9 @@ def looks_like_heading(line: str) -> bool:
     l = line.strip()
     if len(l) < 3:
         return False
-    # Headings are typically short
     words = l.split()
     if len(words) > 6:
         return False
-    # Ends with colon or all caps
     if l.endswith(":"):
         return True
     if l.upper() == l and any(c.isalpha() for c in l) and len(l) <= 40:
@@ -226,10 +550,6 @@ def normalise_postcode(m1: str, m2: str) -> str:
 
 
 def parse_month_year(s: str) -> Tuple[Optional[date], float]:
-    """
-    Parse "Nov 2024" or "2024" to date.
-    Returns (date_obj, confidence)
-    """
     s0 = s.strip().lower()
     if re.fullmatch(r"(19|20)\d{2}", s0):
         try:
@@ -280,7 +600,6 @@ def load_spacy_model():
 # ---------------------------------------------------------------------
 DEFAULT_SKILL_CATALOGUE: Dict[str, Any] = {
     "canonical": [
-        # Security
         "SIA",
         "SIA Door Supervisor",
         "SIA CCTV",
@@ -300,8 +619,6 @@ DEFAULT_SKILL_CATALOGUE: Dict[str, Any] = {
         "GDPR and data protection compliance",
         "Record keeping",
         "Risk assessment",
-
-        # Warehouse
         "Picking and packing",
         "Order picking",
         "RF scanning",
@@ -312,15 +629,11 @@ DEFAULT_SKILL_CATALOGUE: Dict[str, Any] = {
         "Reach truck",
         "Manual handling",
         "PPE compliance",
-
-        # Hospitality
         "Housekeeping",
         "Room attendant",
         "Front of house",
         "Food hygiene",
         "Bar service",
-
-        # General
         "Microsoft Excel",
         "Microsoft Word",
         "Team leadership",
@@ -361,7 +674,6 @@ class SkillCatalogue:
         self.variants: Dict[str, List[str]] = data.get("variants", {})
         self.abbreviations: Dict[str, List[str]] = data.get("abbreviations", {})
 
-        # Build reverse maps
         self.variant_to_canonical: Dict[str, str] = {}
         for canon, vars_ in self.variants.items():
             for v in vars_:
@@ -383,33 +695,24 @@ class SkillCatalogue:
         return SkillCatalogue(DEFAULT_SKILL_CATALOGUE, nlp=nlp)
 
     def canonicalise(self, text: str, context_text: str = "") -> Tuple[str, float, str]:
-        """
-        Returns: (canonical, confidence, method)
-        method: exact, variant, abbrev, embed, passthrough
-        """
         t = text.strip()
         if not t:
             return "", 0.0, "passthrough"
 
         low = t.lower()
 
-        # Exact canonical match
         for canon in self.canonical:
             if low == canon.lower():
                 return canon, 0.98, "exact"
 
-        # Variant match
         if low in self.variant_to_canonical:
             return self.variant_to_canonical[low], 0.95, "variant"
 
-        # Abbreviation match with simple domain context
         up = re.sub(r"[^A-Za-z]", "", t).upper()
         if up in self.abbreviations:
-            # If ambiguous abbreviations exist, you can extend this logic.
             candidates = self.abbreviations[up]
             if len(candidates) == 1:
                 return candidates[0], 0.88, "abbrev"
-            # Basic disambiguation
             ctx = context_text.lower()
             if "sia" in ctx or "security" in ctx:
                 for c in candidates:
@@ -417,7 +720,6 @@ class SkillCatalogue:
                         return c, 0.80, "abbrev"
             return candidates[0], 0.70, "abbrev"
 
-        # Embedding nearest neighbour for recall
         if self.nlp and self._canon_vectors:
             v = self.nlp(t).vector
             best = ("", 0.0)
@@ -426,12 +728,10 @@ class SkillCatalogue:
                 if sim > best[1]:
                     best = (canon, sim)
             if best[1] >= CONFIG.embedding_similarity_threshold:
-                # Map similarity to a confidence band
                 conf = safe_clip01((best[1] - CONFIG.embedding_similarity_threshold) / (1.0 - CONFIG.embedding_similarity_threshold))
                 conf = 0.60 + 0.35 * conf
                 return best[0], conf, "embed"
 
-        # Passthrough phrase
         return self._title_like(t), 0.55, "passthrough"
 
     @staticmethod
@@ -448,14 +748,7 @@ class SkillCatalogue:
 # Document extraction
 # ---------------------------------------------------------------------
 class DocumentExtractor:
-    def __init__(self):
-        pass
-
     def extract_text(self, file_bytes: bytes, filename: str) -> Dict[str, str]:
-        """
-        Returns dict with: raw_text, clean_text
-        clean_text preserves line breaks.
-        """
         name = filename.lower()
         if name.endswith(".pdf"):
             raw = self._extract_pdf(file_bytes)
@@ -496,23 +789,22 @@ class DocumentExtractor:
 
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                # Try layout aware extraction first
-                txt = page.extract_text(layout=True, x_tolerance=2, y_tolerance=2)
-                if not txt:
-                    txt = self._reconstruct_from_words(page)
-                txt = txt or ""
-                pages_text.append(txt)
+                txt = ""
+                try:
+                    txt = page.extract_text(layout=True, x_tolerance=2, y_tolerance=2) or ""
+                except Exception:
+                    txt = ""
 
-                # Keep lines for header/footer detection
+                if not txt:
+                    txt = self._reconstruct_from_words(page) or ""
+
+                pages_text.append(txt)
                 lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
                 page_lines_list.append(lines)
 
-        # Remove repeating headers and footers
         cleaned_pages = self._drop_repeated_header_footer(page_lines_list)
-
         joined = "\n\n".join("\n".join(lines) for lines in cleaned_pages).strip()
 
-        # OCR fallback if scanned
         alpha_chars = sum(ch.isalpha() for ch in joined)
         if CONFIG.enable_ocr_fallback and alpha_chars < CONFIG.min_extracted_alpha_chars_for_pdf:
             ocr_text = self._ocr_pdf(file_bytes)
@@ -527,7 +819,6 @@ class DocumentExtractor:
             words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
             if not words:
                 return ""
-            # Cluster by line using 'top'
             words_sorted = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
             lines = []
             current_top = None
@@ -557,7 +848,6 @@ class DocumentExtractor:
         if n_pages < 2:
             return page_lines_list
 
-        # Count occurrences of exact lines across pages
         freq: Dict[str, int] = {}
         for lines in page_lines_list:
             unique = set(lines)
@@ -603,8 +893,6 @@ class DocumentExtractor:
 class SectionParser:
     def __init__(self, config: AppConfig):
         self.config = config
-
-        # Build normalised header map
         self.header_to_section: Dict[str, str] = {}
         for section, aliases in config.section_aliases.items():
             for a in aliases:
@@ -620,7 +908,6 @@ class SectionParser:
             nonlocal buf, current
             if buf:
                 sections.setdefault(current, [])
-                # extend while keeping non-empty lines
                 sections[current].extend([x for x in buf if x.strip()])
             buf = []
 
@@ -628,16 +915,13 @@ class SectionParser:
             lnl = ln.lower().strip(": ").strip()
             section_found = None
 
-            # Detect known section headings
             if looks_like_heading(ln):
                 lnl2 = lnl.replace("&", "and")
                 for key, sec in self.header_to_section.items():
                     if lnl2 == key:
                         section_found = sec
                         break
-                    # Allow partial heading matches for high recall
                     if lnl2 in key or key in lnl2:
-                        # Avoid mapping short generic headings incorrectly
                         if len(lnl2.split()) <= 4:
                             section_found = sec
                             break
@@ -674,12 +958,7 @@ class ContactExtractor:
         return dedupe_preserve_order(out)
 
     def extract_uk_phones(self, text: str) -> List[str]:
-        """
-        High recall phone extraction using phonenumbers where available.
-        Falls back to permissive regex.
-        """
         candidates = []
-        # permissive raw candidates
         raw = re.findall(r"(\+44\s?\d[\d\s]{8,13}|\b0\d[\d\s]{8,13})", text)
         raw = [re.sub(r"\s+", " ", r).strip() for r in raw]
         raw = dedupe_preserve_order(raw)
@@ -697,7 +976,6 @@ class ContactExtractor:
             if candidates:
                 return candidates[:3]
 
-        # fallback
         cleaned = []
         for r in raw:
             digits = re.sub(r"\D", "", r)
@@ -715,9 +993,6 @@ class ContactExtractor:
         return out
 
     def extract_address(self, text: str, postcodes: List[str]) -> Tuple[Optional[str], float, str]:
-        """
-        UK address heuristic: use postcode anchor and grab neighbouring lines.
-        """
         if not postcodes:
             return None, 0.0, "none"
 
@@ -725,7 +1000,6 @@ class ContactExtractor:
         best = ("", 0.0, "postcode_window")
 
         for pc in postcodes:
-            # Find line index containing postcode
             idxs = [i for i, ln in enumerate(lines) if pc.replace(" ", "") in ln.replace(" ", "").upper()]
             for idx in idxs:
                 start = max(0, idx - 3)
@@ -733,9 +1007,9 @@ class ContactExtractor:
                 chunk = lines[start:end]
                 addr = ", ".join([c.strip(" ,") for c in chunk if c.strip()])
                 addr = re.sub(r"\s+", " ", addr).strip()
-                # Score address plausibility
+
                 score = 0.4
-                if any(re.search(r"\b(road|rd|street|st|lane|ln|avenue|ave|drive|dr|close|cl|way|court|ct|flat|house)\b", addr, re.I) for _ in [0]):
+                if re.search(r"\b(road|rd|street|st|lane|ln|avenue|ave|drive|dr|close|cl|way|court|ct|flat|house)\b", addr, re.I):
                     score += 0.25
                 if re.search(r"\b\d{1,4}\b", addr):
                     score += 0.15
@@ -760,22 +1034,11 @@ class NameResolver:
 
     @staticmethod
     def infer_name_from_filename(filename: str) -> Tuple[Optional[str], float]:
-        """
-        Example: Resume-Manisha_mukeshbhai-Radadiya.pdf -> Manisha Mukeshbhai Radadiya
-        """
         stem = Path(filename).stem
-
-        # Remove leading markers
         stem = re.sub(r"(?i)\b(resume|cv)\b", " ", stem)
         stem = re.sub(r"(?i)\b(final|latest|updated)\b", " ", stem)
-
-        # Replace separators
         stem = re.sub(r"[_\.\-]+", " ", stem)
-
-        # Split camel case a bit
         stem = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem)
-
-        # Remove digits and extra tokens
         stem = re.sub(r"\b\d+\b", " ", stem)
         stem = re.sub(r"\s+", " ", stem).strip()
 
@@ -783,14 +1046,12 @@ class NameResolver:
             return None, 0.0
 
         tokens = stem.split()
-        # Keep 2 to 5 token names
         if len(tokens) < 2:
             return None, 0.0
         if len(tokens) > 6:
             tokens = tokens[:6]
 
         name = " ".join([t.capitalize() if not t.isupper() else t for t in tokens]).strip()
-        # Basic validity
         if re.search(r"[^A-Za-z\s'’\-]", name):
             return None, 0.0
 
@@ -800,9 +1061,6 @@ class NameResolver:
         return name, conf
 
     def extract_name_from_content(self, text: str) -> Tuple[Optional[str], float]:
-        """
-        High recall: search header region, remove contact noise, use spaCy PERSON, plus strict regex fallback.
-        """
         if not text.strip():
             return None, 0.0
 
@@ -837,14 +1095,11 @@ class NameResolver:
             if len(parts) < 2 or len(parts) > 5:
                 return False
             if any(len(p) == 1 for p in parts):
-                # initials are allowed but not too many
                 if sum(len(p) == 1 for p in parts) >= 2:
                     return False
             return True
 
         candidates: List[Tuple[str, float]] = []
-
-        # Regex candidates from first lines
         name_line_re = re.compile(r"^([A-Za-z][A-Za-z'’\-]+(?:\s+[A-Za-z][A-Za-z'’\-]+){1,4})$")
 
         for i, ln in enumerate(header_lines[:15]):
@@ -864,14 +1119,12 @@ class NameResolver:
                 nm = m2.group(1).strip()
                 candidates.append((nm, 0.88))
 
-        # spaCy PERSON entities in header
         if self.nlp:
             try:
                 doc = self.nlp(header_block)
                 for ent in doc.ents:
                     if ent.label_ == "PERSON":
-                        nm = strip_noise(ent.text)
-                        nm = nm.strip()
+                        nm = strip_noise(ent.text).strip()
                         if nm.isupper():
                             nm = " ".join(w.capitalize() for w in nm.split())
                         if plausible_name(nm):
@@ -882,7 +1135,6 @@ class NameResolver:
         if not candidates:
             return None, 0.0
 
-        # Pick best, prefer longer but not too long
         candidates.sort(key=lambda x: (x[1], len(x[0].split())), reverse=True)
         best = candidates[0]
         return best[0], best[1]
@@ -892,35 +1144,27 @@ class NameResolver:
 
         if content_name and not file_name:
             return {"full_name": content_name, "name_source": "content", "name_confidence": safe_clip01(content_conf)}
-
         if file_name and not content_name:
             return {"full_name": file_name, "name_source": "filename", "name_confidence": safe_clip01(file_conf)}
-
         if not content_name and not file_name:
             return {"full_name": None, "name_source": "none", "name_confidence": 0.0}
 
-        # Both present, fuzzy reconcile
         c = content_name or ""
         f = file_name or ""
 
         if RAPIDFUZZ_AVAILABLE:
             sim = fuzz.token_set_ratio(c, f) / 100.0
         else:
-            # Light fallback
             sim = self._simple_token_similarity(c, f)
 
-        # If close, prefer content but mark merged
         if sim >= 0.90:
             conf = safe_clip01(max(content_conf, file_conf) + 0.05)
             return {"full_name": content_name, "name_source": "merged", "name_confidence": conf}
-
-        # If somewhat close, merge tokens for a best guess
         if sim >= 0.75:
             merged = self._merge_names(c, f)
             conf = safe_clip01(max(content_conf, file_conf) - 0.05)
             return {"full_name": merged, "name_source": "merged", "name_confidence": conf}
 
-        # If far, pick higher confidence source
         if content_conf >= file_conf:
             return {"full_name": content_name, "name_source": "content", "name_confidence": safe_clip01(content_conf - 0.10)}
         return {"full_name": file_name, "name_source": "filename", "name_confidence": safe_clip01(file_conf - 0.10)}
@@ -959,15 +1203,10 @@ class LicenceExtractor:
         ]
 
     def extract(self, sections: Dict[str, List[str]], full_text: str) -> List[Dict[str, Any]]:
-        """
-        High recall: check certifications section first, else scan full text for known phrases.
-        """
         results: List[Dict[str, Any]] = []
-
         source_section = "certifications" if "certifications" in sections else None
         lines = sections.get("certifications", [])
         if not lines:
-            # fallback scan in whole document lines
             lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
             source_section = "content"
 
@@ -977,7 +1216,6 @@ class LicenceExtractor:
                 continue
             if any(k in low for k in self.keywords):
                 canon, conf, method = self.catalogue.canonicalise(ln, context_text=full_text)
-                # Keep full line as evidence, but do not explode normal skills here
                 results.append({
                     "text": ln,
                     "canonical": canon,
@@ -986,7 +1224,6 @@ class LicenceExtractor:
                     "method": method,
                 })
 
-        # Deduplicate by canonical
         seen = set()
         out = []
         for r in results:
@@ -999,46 +1236,35 @@ class LicenceExtractor:
 
 
 # ---------------------------------------------------------------------
-# Skills extraction, high recall hybrid pipeline
+# Skills extraction (kept as in your version)
 # ---------------------------------------------------------------------
 class SkillsExtractor:
     def __init__(self, nlp, catalogue: SkillCatalogue):
         self.nlp = nlp
         self.catalogue = catalogue
-
-        self.skill_section_names = {"skills", "summary", "experience"}
-
-        # For phrase cleanup
         self.stop_starts = {"responsible", "responsibilities", "duties", "role", "worked", "working"}
 
     def extract(self, sections: Dict[str, List[str]], full_text: str) -> Dict[str, Any]:
         mentions: List[Dict[str, Any]] = []
 
-        # 1) Section-aware strong candidates from skill section
         skill_lines = sections.get("skills", [])
         mentions.extend(self._extract_from_lines(skill_lines, section="skills", context_text=full_text, base_conf=0.90))
 
-        # 2) Additional candidates from summary and experience bullets for recall
         summary_lines = sections.get("summary", [])
         mentions.extend(self._extract_from_lines(summary_lines, section="summary", context_text=full_text, base_conf=0.70))
 
         exp_lines = sections.get("experience", [])
-        # only bullet-like and short lines from experience to reduce noise
         exp_candidates = [ln for ln in exp_lines if CONFIG.bullet_re.match(ln) or (len(ln.split()) <= 12 and len(ln) >= 8)]
         mentions.extend(self._extract_from_lines(exp_candidates, section="experience", context_text=full_text, base_conf=0.65))
 
-        # 3) Dictionary spotting across the whole document for missed skills
         mentions.extend(self._extract_dictionary_hits(full_text))
 
-        # Canonical aggregation
         canon_all = []
         for m in mentions:
             if m.get("canonical"):
                 canon_all.append(m["canonical"])
-
         canon_all = dedupe_preserve_order(canon_all)
 
-        # If configured, keep unmatched phrases as canonical too, especially from skills section
         if CONFIG.keep_unmatched_skill_phrases:
             for m in mentions:
                 if m.get("canonical"):
@@ -1047,7 +1273,6 @@ class SkillsExtractor:
                     canon_all.append(m["text"])
             canon_all = dedupe_preserve_order(canon_all)
 
-        # Deduplicate mentions by (canonical, text, section)
         seen = set()
         dedup_mentions = []
         for m in mentions:
@@ -1057,7 +1282,6 @@ class SkillsExtractor:
             seen.add(key)
             dedup_mentions.append(m)
 
-        # Sort by confidence desc
         dedup_mentions.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
 
         return {
@@ -1073,16 +1297,12 @@ class SkillsExtractor:
                 continue
             ln0 = CONFIG.bullet_re.sub("", ln0).strip()
 
-            # Treat bullet line and comma lists as strong candidates
             candidates = self._split_skill_line(ln0)
-            # Also phrase mine for multi-word skills
             candidates.extend(self._phrase_mine(ln0))
-
             candidates = dedupe_preserve_order([c for c in candidates if len(c) >= 2])
 
             for c in candidates:
                 canon, conf, method = self.catalogue.canonicalise(c, context_text=context_text)
-                # Confidence shaping
                 conf2 = conf
                 if section == "skills":
                     conf2 = max(conf2, base_conf if method in {"exact", "variant", "abbrev"} else base_conf - 0.10)
@@ -1100,13 +1320,9 @@ class SkillsExtractor:
         return out
 
     def _extract_dictionary_hits(self, full_text: str) -> List[Dict[str, Any]]:
-        """
-        High recall: scan for variants and canonical tokens in text.
-        """
         out: List[Dict[str, Any]] = []
         low = full_text.lower()
 
-        # Canonical direct substrings
         for canon in self.catalogue.canonical:
             if canon.lower() in low:
                 out.append({
@@ -1118,7 +1334,6 @@ class SkillsExtractor:
                     "method": "dictionary"
                 })
 
-        # Variants direct substrings
         for v, canon in self.catalogue.variant_to_canonical.items():
             if v in low:
                 out.append({
@@ -1130,7 +1345,6 @@ class SkillsExtractor:
                     "method": "dictionary"
                 })
 
-        # Abbreviations
         for abbr, canons in self.catalogue.abbreviations.items():
             if re.search(rf"\b{re.escape(abbr)}\b", full_text, flags=re.I):
                 for c in canons[:1]:
@@ -1147,46 +1361,35 @@ class SkillsExtractor:
 
     @staticmethod
     def _split_skill_line(line: str) -> List[str]:
-        # Preserve the full phrase too
         parts = [line.strip()]
-        # Split on separators
         chunks = re.split(r"[;,/|]+", line)
         for ch in chunks:
             ch2 = ch.strip()
             if ch2 and ch2.lower() not in {"skills", "technical skills"}:
                 parts.append(ch2)
 
-        # Split comma separated lists
         chunks2 = [c.strip() for c in re.split(r"\s*,\s*", line) if c.strip()]
         parts.extend(chunks2)
 
-        # Keep "X and Y" as both combined and individual if reasonable
         if " and " in line.lower():
             and_parts = [p.strip() for p in re.split(r"(?i)\band\b", line) if p.strip()]
             if 2 <= len(and_parts) <= 4:
                 parts.extend(and_parts)
 
-        # Remove overly short
         return [p for p in parts if len(p.split()) <= 14]
 
     def _phrase_mine(self, line: str) -> List[str]:
-        """
-        spaCy noun chunk mining plus light pattern mining.
-        """
         out = []
         if not self.nlp:
             return out
 
         try:
             doc = self.nlp(line)
-            # noun chunks
-            for nc in doc.noun_chunks:
-                t = nc.text.strip()
-                t = t.strip(" .,:;()[]{}")
+            for nc in getattr(doc, "noun_chunks", []):
+                t = nc.text.strip().strip(" .,:;()[]{}")
                 if 2 <= len(t.split()) <= 12:
                     out.append(t)
 
-            # pattern: sequences of NOUN/PROPN/ADJ with conjunction
             buff = []
             for tok in doc:
                 if tok.is_stop and tok.text.lower() not in {"and", "&"}:
@@ -1230,7 +1433,7 @@ class SkillsExtractor:
 
 
 # ---------------------------------------------------------------------
-# Experience extraction, structured roles
+# Experience extraction (kept as in your version)
 # ---------------------------------------------------------------------
 class ExperienceExtractor:
     def __init__(self, nlp, config: AppConfig):
@@ -1240,28 +1443,23 @@ class ExperienceExtractor:
     def extract(self, sections: Dict[str, List[str]], full_text: str) -> List[Dict[str, Any]]:
         exp_lines = sections.get("experience", [])
         if not exp_lines:
-            # fallback to full document if no experience section detected
             exp_lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
 
         blocks = self._split_into_role_blocks(exp_lines)
         roles = []
         for b in blocks:
-            role = self._parse_role_block(b, full_text)
+            role = self._parse_role_block(b)
             if role:
                 roles.append(role)
         return roles
 
     def _split_into_role_blocks(self, lines: List[str]) -> List[List[str]]:
-        """
-        Split by date range triggers and blank line runs.
-        """
         blocks: List[List[str]] = []
         buf: List[str] = []
 
         def flush():
             nonlocal buf
             if buf:
-                # Remove trailing blanks
                 cleaned = [x for x in buf if x.strip()]
                 if cleaned:
                     blocks.append(cleaned)
@@ -1269,14 +1467,12 @@ class ExperienceExtractor:
 
         for ln in lines:
             if not ln.strip():
-                # treat blank as block separator if buffer is sufficiently large
                 if len(buf) >= 3:
                     flush()
                 else:
                     buf.append(ln)
                 continue
 
-            # Start new block when a date range appears and buffer already has content
             if self.config.date_range_re.search(ln) and len(buf) >= 2:
                 flush()
                 buf.append(ln)
@@ -1285,7 +1481,6 @@ class ExperienceExtractor:
 
         flush()
 
-        # Merge tiny blocks into neighbours for recall
         merged: List[List[str]] = []
         for b in blocks:
             if len(b) <= 2 and merged:
@@ -1294,12 +1489,11 @@ class ExperienceExtractor:
                 merged.append(b)
         return merged
 
-    def _parse_role_block(self, lines: List[str], full_text: str) -> Optional[Dict[str, Any]]:
+    def _parse_role_block(self, lines: List[str]) -> Optional[Dict[str, Any]]:
         raw_block = [ln.strip() for ln in lines if ln.strip()]
         if len(raw_block) < 2:
             return None
 
-        # Identify date line
         date_line_idx = None
         date_match = None
         for i, ln in enumerate(raw_block[:8]):
@@ -1312,15 +1506,12 @@ class ExperienceExtractor:
         header_lines = raw_block[:date_line_idx] if date_line_idx is not None else raw_block[:2]
         header_text = " | ".join(header_lines).strip()
 
-        # Responsibilities are bullet lines after date line, else after header
         start_resp_idx = (date_line_idx + 1) if date_line_idx is not None else len(header_lines)
         resp_lines = raw_block[start_resp_idx:]
         responsibilities = self._clean_bullets(resp_lines)
 
         start_date, end_date, date_conf = self._parse_date_range(date_match.group(0)) if date_match else (None, None, 0.0)
-
         job_title, employer, location, header_conf, evidence = self._extract_header_fields(header_text)
-
         industry_tags = self._infer_industry(job_title, employer, responsibilities)
         dur = self._duration_months(start_date, end_date)
 
@@ -1350,7 +1541,6 @@ class ExperienceExtractor:
             }
         }
 
-        # Skip obviously empty roles
         if not role["job_title"] and not role["employer"] and not date_match:
             return None
         return role
@@ -1363,7 +1553,6 @@ class ExperienceExtractor:
             if not t:
                 continue
             t = CONFIG.bullet_re.sub("", t).strip()
-            # ignore headings inside a block
             if looks_like_heading(t):
                 continue
             if len(t) < 8:
@@ -1389,7 +1578,6 @@ class ExperienceExtractor:
 
         ed, ec = parse_month_year(end_raw)
         if ed is None:
-            # year-only end
             if re.fullmatch(r"(19|20)\d{2}", end_raw.strip()):
                 try:
                     y = int(end_raw.strip())
@@ -1401,19 +1589,13 @@ class ExperienceExtractor:
         if ed is None:
             return date_to_yyyy_mm(sd), None, 0.70
 
-        # sanity check
         conf = min(0.92, 0.60 + 0.20 * sc + 0.20 * ec)
         return date_to_yyyy_mm(sd), date_to_yyyy_mm(ed), conf
 
     def _extract_header_fields(self, header_text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, float], List[str]]:
-        """
-        Extract job_title, employer, location from a combined header line.
-        Uses separators and spaCy ORG, GPE if available.
-        """
         evidence = [header_text]
         conf = {"job_title": 0.55, "employer": 0.45, "location": 0.35}
 
-        # Try split by common separators
         parts = [p.strip() for p in re.split(r"\s*\|\s*|\s*-\s*|\s*•\s*|\s*,\s*", header_text) if p.strip()]
         parts = parts[:6]
 
@@ -1421,13 +1603,11 @@ class ExperienceExtractor:
         employer = None
         location = None
 
-        # spaCy assist
         if self.nlp:
             try:
                 doc = self.nlp(header_text)
                 orgs = [ent.text.strip() for ent in doc.ents if ent.label_ in {"ORG"}]
                 geos = [ent.text.strip() for ent in doc.ents if ent.label_ in {"GPE", "LOC"}]
-
                 if orgs:
                     employer = orgs[0]
                     conf["employer"] = 0.75
@@ -1437,29 +1617,23 @@ class ExperienceExtractor:
             except Exception:
                 pass
 
-        # Heuristic for job title: first part that looks like a role
-        # Keep high recall, but avoid picking an address-like part
         for p in parts:
             pl = p.lower()
-            if any(k in pl for k in ["road", "street", "london", "manchester", "birmingham"]) and re.search(r"\d", p):
+            if any(k in pl for k in ["road", "street", "lane", "avenue", "drive"]) and re.search(r"\d", p):
                 continue
             if len(p.split()) <= 8:
-                # role-like tokens
                 if any(w in pl for w in ["supervisor", "officer", "guard", "steward", "operative", "picker", "packer", "driver", "housekeeper", "waiter", "reception", "admin", "security"]):
                     job_title = p
                     conf["job_title"] = 0.80
                     break
 
-        # If still missing title, take first part
         if not job_title and parts:
             job_title = parts[0]
             conf["job_title"] = 0.65
 
-        # Employer fallback: a part that looks like a company name
         if not employer:
             for p in parts[1:]:
                 if len(p.split()) <= 10 and any(ch.isalpha() for ch in p):
-                    # contains Ltd, Limited, Group etc
                     if re.search(r"\b(ltd|limited|group|services|security|solutions|hotel|warehouse)\b", p, re.I):
                         employer = p
                         conf["employer"] = 0.70
@@ -1468,7 +1642,6 @@ class ExperienceExtractor:
                 employer = parts[1]
                 conf["employer"] = 0.55
 
-        # Location fallback
         if not location:
             for p in parts:
                 if re.search(r"\b(uk|london|manchester|birmingham|leeds|glasgow|bristol|hounslow|slough|reading)\b", p, re.I):
@@ -1497,7 +1670,6 @@ class ExperienceExtractor:
             return None
 
         if not end_date or end_date == "Current":
-            # Cannot reliably compute without current date reference in data layer
             return None
 
         try:
@@ -1535,7 +1707,6 @@ class KeywordSummariser:
         return [k for k, _ in items[:top_n]]
 
     def summary(self, text: str, keywords: List[str], max_words: int = 160) -> str:
-        # Keep line-based sentences for CV structure
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         scored = []
         top_kw = set([k.lower() for k in keywords[:18]])
@@ -1557,12 +1728,12 @@ class KeywordSummariser:
             wc += n
         if out:
             return " ".join(out)
-        # fallback
         return " ".join(text.split()[:max_words])
 
 
 # ---------------------------------------------------------------------
 # Main CV parser
+# Adds parse_bytes for WorkDrive downloads
 # ---------------------------------------------------------------------
 class CVParser:
     def __init__(self, nlp, catalogue: SkillCatalogue, config: AppConfig):
@@ -1576,16 +1747,19 @@ class CVParser:
         self.exp = ExperienceExtractor(nlp, config)
         self.kw = KeywordSummariser()
 
-    def parse_file(self, path: Path) -> Dict[str, Any]:
-        t0 = time.time()
+    def parse_path(self, path: Path) -> Dict[str, Any]:
         file_bytes = path.read_bytes()
-        extracted = self.docx.extract_text(file_bytes, path.name)
+        return self.parse_bytes(file_bytes=file_bytes, filename=path.name, path_hint=str(path))
+
+    def parse_bytes(self, file_bytes: bytes, filename: str, path_hint: str = "") -> Dict[str, Any]:
+        t0 = time.time()
+        extracted = self.docx.extract_text(file_bytes, filename)
         clean_text = extracted["clean_text"]
 
         sections = self.sections.split_sections(clean_text)
 
         content_name, content_conf = self.name.extract_name_from_content(clean_text)
-        name_info = self.name.reconcile(content_name, content_conf, path.name)
+        name_info = self.name.reconcile(content_name, content_conf, filename)
 
         emails = self.contact.extract_emails(clean_text)
         phones = self.contact.extract_uk_phones(clean_text)
@@ -1603,8 +1777,8 @@ class CVParser:
 
         result = {
             "metadata": {
-                "filename": path.name,
-                "path": str(path),
+                "filename": filename,
+                "path": path_hint,
                 "processed_at": datetime.now().isoformat(),
                 "elapsed_seconds": round(elapsed, 3),
                 "text_length": len(clean_text),
@@ -1680,33 +1854,33 @@ class CVParser:
 
 
 # ---------------------------------------------------------------------
-# Folder scanning
+# Local folder scanning
+# Searches every subfolder recursively and only returns Resume/CV prefix files
 # ---------------------------------------------------------------------
-def discover_cv_files(root_dir: str, config: AppConfig) -> List[Path]:
+def discover_cv_files_local(root_dir: str, config: AppConfig, exact_filename: str = "") -> List[Path]:
     root = Path(root_dir).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         raise ValueError("Folder path does not exist or is not a directory.")
 
     out: List[Path] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in config.supported_exts:
-            continue
+    max_bytes = config.max_file_mb * 1024 * 1024
 
-        # file size check
-        try:
-            mb = p.stat().st_size / (1024 * 1024)
-            if mb > config.max_file_mb:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+        for fn in filenames:
+            if not is_resume_filename(fn, supported_exts=config.supported_exts, exact_filename=exact_filename):
                 continue
-        except Exception:
-            continue
 
-        stem_low = p.name.lower()
-        if any(k in stem_low for k in config.filename_must_contain):
+            p = Path(dirpath) / fn
+            try:
+                if p.stat().st_size > max_bytes:
+                    continue
+            except Exception:
+                continue
+
             out.append(p)
 
-    # Stable order
     out.sort(key=lambda x: str(x).lower())
     return out
 
@@ -1715,81 +1889,157 @@ def discover_cv_files(root_dir: str, config: AppConfig) -> List[Path]:
 # Streamlit UI
 # ---------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="CV Parser Folder Pro", page_icon="📄", layout="wide")
+    st.set_page_config(page_title="CV Parser WorkDrive Recursive", page_icon="📄", layout="wide")
 
-    st.title("📄 CV Parser Folder Pro")
-    st.caption("High recall UK staffing CV parsing. Folder batch mode with structured experience and maximum recall skills.")
+    st.title("📄 CV Parser WorkDrive Recursive")
+    st.caption("Recursively scans folder, subfolder, subfolder of subfolder, then filters only Resume or CV filename prefix.")
 
     nlp = load_spacy_model()
     if not nlp:
-        st.warning("spaCy model not loaded. The parser will still run, but name, skills, and experience accuracy will be lower.")
+        st.warning("spaCy model not loaded. Parser will run but accuracy will be lower.")
 
     with st.sidebar:
-        st.header("⚙️ Configuration")
+        st.header("⚙️ Source")
+        source = st.radio("Choose source", ["Zoho WorkDrive", "Local folder"], index=0)
 
-        folder = st.text_input("Folder path", value=str(Path.cwd()))
-        catalogue_path = st.text_input("Skills catalogue JSON path (optional)", value="")
+        st.markdown("---")
+        st.header("🔎 File filtering")
+        exact_filename = st.text_input(
+            "Exact filename (optional)",
+            value="",
+            help="If you enter: Resume-Manisha_mukeshbhai-Radadiya.docx then only this file will be returned if found anywhere in subfolders."
+        )
+        include_subfolders = st.checkbox("Search all subfolders", value=True)
 
+        st.markdown("---")
+        st.header("🧠 Parser settings")
         enable_ocr = st.checkbox("Enable OCR fallback for scanned PDFs", value=CONFIG.enable_ocr_fallback)
         CONFIG.enable_ocr_fallback = enable_ocr
 
-        max_workers = st.slider("Max workers", min_value=1, max_value=12, value=CONFIG.max_workers, step=1)
-        CONFIG.max_workers = max_workers
-
-        sim_threshold = st.slider("Embedding similarity threshold", min_value=0.55, max_value=0.90, value=float(CONFIG.embedding_similarity_threshold), step=0.01)
+        sim_threshold = st.slider(
+            "Embedding similarity threshold",
+            min_value=0.55,
+            max_value=0.90,
+            value=float(CONFIG.embedding_similarity_threshold),
+            step=0.01
+        )
         CONFIG.embedding_similarity_threshold = float(sim_threshold)
 
         show_debug = st.checkbox("Show debug logs", value=False)
 
         st.markdown("---")
-        st.write("File filter:")
-        st.write(f"Extensions: {', '.join(CONFIG.supported_exts)}")
-        st.write(f"Filename contains: {', '.join(CONFIG.filename_must_contain)}")
+        st.write("Resume filter rule")
+        st.write("Extensions:", ", ".join(CONFIG.supported_exts))
+        st.write("Filename must start with Resume or CV")
+        st.write("Example:", "Resume-Manisha_mukeshbhai-Radadiya.docx")
 
-    # Load catalogue
+    # Source specific inputs
+    workdrive_folder_link_or_id = ""
+    local_folder = ""
+
+    if source == "Zoho WorkDrive":
+        st.subheader("Zoho WorkDrive")
+        workdrive_folder_link_or_id = st.text_input(
+            "WorkDrive folder link or folder ID",
+            value="",
+            help="Paste the folder link or the folder ID. This app will extract the ID if possible."
+        )
+    else:
+        st.subheader("Local folder")
+        local_folder = st.text_input("Local folder path", value=str(Path.cwd()))
+
+    catalogue_path = st.text_input("Skills catalogue JSON path (optional)", value="")
     catalogue = SkillCatalogue.load_from_path(catalogue_path.strip() or None, nlp=nlp)
     parser = CVParser(nlp, catalogue, CONFIG)
 
-    colA, colB = st.columns([1, 1])
+    col1, col2 = st.columns([1, 1])
 
-    with colA:
-        if st.button("🔎 Scan folder", type="secondary"):
+    # Scan button
+    with col1:
+        if st.button("🔎 Scan and list resume files", type="secondary"):
             try:
-                files = discover_cv_files(folder, CONFIG)
-                st.session_state["discovered_files"] = files
-                st.success(f"Found {len(files)} matching CV files.")
+                if source == "Local folder":
+                    files = discover_cv_files_local(local_folder, CONFIG, exact_filename=exact_filename.strip())
+                    st.session_state["matched_local_files"] = files
+                    st.session_state["matched_workdrive_files"] = []
+                    st.success(f"Found {len(files)} resume files (recursive).")
+                else:
+                    if not workdrive_folder_link_or_id.strip():
+                        st.error("Paste a WorkDrive folder link or folder ID.")
+                    else:
+                        wd = ZohoWorkDriveClient()
+                        folder_id = wd.extract_resource_id(workdrive_folder_link_or_id)
+                        items = wd.list_resume_files_recursive(
+                            root_folder_id=folder_id,
+                            include_subfolders=include_subfolders,
+                            supported_exts=CONFIG.supported_exts,
+                            exact_filename=exact_filename.strip()
+                        )
+                        st.session_state["matched_workdrive_files"] = items
+                        st.session_state["matched_local_files"] = []
+                        st.success(f"Found {len(items)} resume files (recursive).")
             except Exception as e:
                 st.error(str(e))
+                if show_debug:
+                    st.code(traceback.format_exc())
 
-    with colB:
-        if st.button("🚀 Process folder", type="primary"):
+    # Process button
+    with col2:
+        if st.button("🚀 Process matched files", type="primary"):
             try:
-                files = discover_cv_files(folder, CONFIG)
-                st.session_state["discovered_files"] = files
-                if not files:
-                    st.warning("No matching CV files found.")
-                else:
-                    results = []
-                    progress = st.progress(0)
-                    status = st.empty()
+                results = []
+                progress = st.progress(0)
+                status = st.empty()
 
-                    for i, f in enumerate(files, start=1):
-                        try:
+                if source == "Local folder":
+                    files: List[Path] = discover_cv_files_local(local_folder, CONFIG, exact_filename=exact_filename.strip())
+                    if not files:
+                        st.warning("No matching resume files found.")
+                    else:
+                        for i, f in enumerate(files, start=1):
                             status.write(f"Processing {i}/{len(files)}: {f.name}")
-                            results.append(parser.parse_file(f))
-                        except Exception as ex:
-                            logger.error(f"Failed parsing {f}: {ex}")
-                            if show_debug:
-                                st.code(traceback.format_exc())
-                            results.append({
-                                "metadata": {"filename": f.name, "path": str(f), "processed_at": datetime.now().isoformat()},
-                                "error": str(ex)
-                            })
-                        progress.progress(int(i * 100 / len(files)))
+                            try:
+                                results.append(parser.parse_path(f))
+                            except Exception as ex:
+                                results.append({
+                                    "metadata": {"filename": f.name, "path": str(f), "processed_at": datetime.now().isoformat()},
+                                    "error": str(ex)
+                                })
+                            progress.progress(int(i * 100 / len(files)))
 
-                    st.session_state["parsed_results"] = results
-                    st.success("Processing complete.")
+                else:
+                    if not workdrive_folder_link_or_id.strip():
+                        st.error("Paste a WorkDrive folder link or folder ID.")
+                    else:
+                        wd = ZohoWorkDriveClient()
+                        folder_id = wd.extract_resource_id(workdrive_folder_link_or_id)
+                        items = wd.list_resume_files_recursive(
+                            root_folder_id=folder_id,
+                            include_subfolders=include_subfolders,
+                            supported_exts=CONFIG.supported_exts,
+                            exact_filename=exact_filename.strip()
+                        )
+                        if not items:
+                            st.warning("No matching resume files found in WorkDrive.")
+                        else:
+                            for i, it in enumerate(items, start=1):
+                                status.write(f"Downloading and processing {i}/{len(items)}: {it['virtual_path']}")
+                                try:
+                                    b = wd.download_file_bytes(it["id"])
+                                    results.append(parser.parse_bytes(
+                                        file_bytes=b,
+                                        filename=it["name"],
+                                        path_hint=f"workdrive:{it['virtual_path']}"
+                                    ))
+                                except Exception as ex:
+                                    results.append({
+                                        "metadata": {"filename": it.get("name"), "path": f"workdrive:{it.get('virtual_path')}", "processed_at": datetime.now().isoformat()},
+                                        "error": str(ex)
+                                    })
+                                progress.progress(int(i * 100 / len(items)))
 
+                st.session_state["parsed_results"] = results
+                st.success("Processing complete.")
             except Exception as e:
                 st.error(str(e))
                 if show_debug:
@@ -1797,16 +2047,37 @@ def main():
 
     st.markdown("---")
 
-    files = st.session_state.get("discovered_files", [])
-    if files:
-        st.subheader("Matched CV files")
-        st.write(f"Total: {len(files)}")
-        st.dataframe(pd.DataFrame({"file": [f.name for f in files], "path": [str(f) for f in files]}), use_container_width=True)
+    # Show matched files
+    if source == "Local folder":
+        matched = st.session_state.get("matched_local_files", [])
+        st.subheader("Matched resume files (local)")
+        if matched:
+            st.write(f"Total: {len(matched)}")
+            st.dataframe(
+                pd.DataFrame({"file": [f.name for f in matched], "path": [str(f) for f in matched]}),
+                use_container_width=True
+            )
+        else:
+            st.info("No matched files yet. Click Scan.")
     else:
-        st.info("Scan or process a folder to see matched files.")
+        matched = st.session_state.get("matched_workdrive_files", [])
+        st.subheader("Matched resume files (WorkDrive)")
+        if matched:
+            st.write(f"Total: {len(matched)}")
+            st.dataframe(
+                pd.DataFrame({
+                    "file": [x.get("name") for x in matched],
+                    "path": [x.get("virtual_path") for x in matched],
+                    "id": [x.get("id") for x in matched],
+                }),
+                use_container_width=True
+            )
+        else:
+            st.info("No matched files yet. Click Scan.")
 
     st.markdown("---")
 
+    # Results
     results = st.session_state.get("parsed_results", [])
     if results:
         st.subheader("Results overview")
@@ -1843,13 +2114,14 @@ def main():
         st.dataframe(df, use_container_width=True)
 
         st.markdown("---")
-        st.subheader("Detailed CV outputs")
+        st.subheader("Detailed outputs")
 
         for idx, r in enumerate(results, start=1):
             fname = r.get("metadata", {}).get("filename", f"cv_{idx}")
             with st.expander(f"{idx}. {fname}", expanded=(idx == 1)):
                 if "error" in r:
                     st.error(r["error"])
+                    st.code(json.dumps(r, indent=2), language="json")
                 else:
                     c1, c2, c3 = st.columns(3)
                     with c1:
@@ -1879,8 +2151,8 @@ def main():
                     st.write("**Summary**")
                     st.info(r.get("summary", ""))
 
-                st.markdown("**JSON**")
-                st.code(json.dumps(r, indent=2), language="json")
+                    st.markdown("**JSON**")
+                    st.code(json.dumps(r, indent=2), language="json")
 
         st.markdown("---")
         st.subheader("Export batch JSON")
@@ -1897,7 +2169,7 @@ def main():
             mime="application/json"
         )
     else:
-        st.info("Process a folder to generate structured JSON outputs.")
+        st.info("Process matched files to generate structured JSON outputs.")
 
 
 if __name__ == "__main__":
