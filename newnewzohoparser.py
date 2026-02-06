@@ -34,11 +34,9 @@ try:
 except Exception:
     DOCX_AVAILABLE = False
 
-try:
-    import spacy
-    SPACY_AVAILABLE = True
-except Exception:
-    SPACY_AVAILABLE = False
+import spacy
+SPACY_AVAILABLE = True
+
 
 try:
     import phonenumbers
